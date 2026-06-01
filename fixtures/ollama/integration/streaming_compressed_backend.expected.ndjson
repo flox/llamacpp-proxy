@@ -1,0 +1,1 @@
+{"error":"backend returned Content-Encoding \"gzip\" for a response that must be translated; the proxy requests identity encoding and cannot safely translate compressed upstream bodies"}

@@ -1,0 +1,1 @@
+{"error":"backend returned a non-SSE response for a streaming request: llama-server returned text/plain while the client was waiting for OpenAI SSE"}

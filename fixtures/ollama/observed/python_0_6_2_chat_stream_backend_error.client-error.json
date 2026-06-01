@@ -1,0 +1,5 @@
+{
+  "error_class": "ResponseError",
+  "message": "backend returned HTTP 502: model failed before stream start (status code: 502)",
+  "status_code": 502
+}

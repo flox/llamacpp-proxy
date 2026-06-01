@@ -1,0 +1,8 @@
+{
+  "method": "GET",
+  "path": "/v1/models",
+  "body": null,
+  "stream": false,
+  "response_kind": "show",
+  "requested_model": "qwen3:32b"
+}

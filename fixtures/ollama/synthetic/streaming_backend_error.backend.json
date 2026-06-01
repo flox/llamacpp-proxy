@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "model failed before stream start",
+    "type": "server_error"
+  }
+}

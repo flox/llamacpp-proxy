@@ -1,0 +1,18 @@
+{
+  "contents": [
+    {
+      "role": "model",
+      "parts": [
+        {"text": "I will inspect the file."},
+        {"functionCall": {"name": "read_file", "args": {"path": "a.txt"}}}
+      ]
+    },
+    {
+      "role": "user",
+      "parts": [
+        {"functionResponse": {"name": "read_file", "response": {"content": "A"}}},
+        {"text": "Continue."}
+      ]
+    }
+  ]
+}

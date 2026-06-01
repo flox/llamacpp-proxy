@@ -1,0 +1,38 @@
+{
+  "_fixture": {
+    "kind": "observed-client-traffic",
+    "client": "ollama-python",
+    "client_version": "0.6.2",
+    "captured_at": "2026-06-01T13:43:13.194561Z",
+    "capture_method": "Captured from an official client library call against a local recorder.",
+    "redactions": [
+      "localhost port",
+      "content-length"
+    ],
+    "response_note": "Recorder returned deterministic success data so the client call could finish."
+  },
+  "method": "POST",
+  "path": "/api/chat",
+  "headers": {
+    "accept-encoding": "gzip, deflate, br",
+    "content-type": "application/json",
+    "accept": "application/json",
+    "user-agent": "ollama-python/0.6.2 (x86_64 linux) Python/3.13.5",
+    "content-length": "<redacted>"
+  },
+  "body": {
+    "model": "qwen3:32b",
+    "stream": true,
+    "options": {
+      "temperature": 0.2,
+      "num_predict": 16
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ],
+    "tools": []
+  }
+}

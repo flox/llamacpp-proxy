@@ -1,0 +1,22 @@
+{
+  "model": "llama-local",
+  "messages": [
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_shell_0",
+          "type": "function",
+          "function": {"name": "shell", "arguments": "{}"}
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_shell_0",
+      "name": "shell",
+      "content": "{\"output\":\"/tmp\"}"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "model": "qwen3:32b",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Say hello."
+    }
+  ],
+  "stream": true,
+  "temperature": 0.2,
+  "max_tokens": 16
+}

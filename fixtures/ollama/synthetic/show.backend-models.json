@@ -1,0 +1,18 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "qwen3:32b-q4_K_M",
+      "object": "model",
+      "created": 1710000000,
+      "meta": {
+        "general.architecture": "qwen3",
+        "general.parameter_count": 32500000000,
+        "quantization_level": "Q4_K_M",
+        "tokenizer.chat_template": "{{ .Prompt }}",
+        "license": "apache-2.0",
+        "capabilities": ["completion", "tools"]
+      }
+    }
+  ]
+}

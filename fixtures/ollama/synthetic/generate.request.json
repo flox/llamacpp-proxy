@@ -1,0 +1,8 @@
+{
+  "model": "codellama:code",
+  "system": "Return JSON only.",
+  "prompt": "Say hello",
+  "stream": false,
+  "format": "json",
+  "options": { "top_p": 0.9, "seed": 7 }
+}

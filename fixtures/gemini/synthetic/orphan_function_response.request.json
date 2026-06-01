@@ -1,0 +1,15 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "functionResponse": {
+            "name": "shell",
+            "response": {"output": "/tmp"}
+          }
+        }
+      ]
+    }
+  ]
+}

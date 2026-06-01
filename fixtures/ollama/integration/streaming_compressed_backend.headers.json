@@ -1,0 +1,6 @@
+{
+  "status": 200,
+  "content-type": "text/event-stream",
+  "content-encoding": "gzip",
+  "note": "Models an upstream that ignored Accept-Encoding: identity during an Ollama streaming request. The proxy must not feed compressed bytes to the SSE transformer."
+}

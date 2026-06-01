@@ -1,0 +1,19 @@
+{
+  "model": "codellama:code",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Return code only."
+    },
+    {
+      "role": "user",
+      "content": "Write hello world in Rust."
+    }
+  ],
+  "stream": true,
+  "response_format": {
+    "type": "json_object"
+  },
+  "top_p": 0.9,
+  "seed": 7
+}

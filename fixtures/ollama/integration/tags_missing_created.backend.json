@@ -1,0 +1,9 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "qwen3:32b",
+      "object": "model"
+    }
+  ]
+}

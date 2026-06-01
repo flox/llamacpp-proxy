@@ -1,0 +1,33 @@
+{
+  "_fixture": {
+    "kind": "observed-client-traffic",
+    "client": "ollama-js",
+    "client_version": "0.6.3",
+    "captured_at": "2026-06-01T13:43:19.887832Z",
+    "capture_method": "Captured from an official client library call against a local recorder.",
+    "redactions": [
+      "localhost port",
+      "content-length"
+    ],
+    "response_note": "Recorder returned the proxy-shaped backend error response for client exception capture."
+  },
+  "method": "POST",
+  "path": "/api/chat",
+  "headers": {
+    "content-type": "application/json",
+    "accept": "application/json",
+    "user-agent": "ollama-js/0.6.3 (x64 linux Node.js/v22.16.0)",
+    "accept-encoding": "gzip, deflate",
+    "content-length": "<redacted>"
+  },
+  "body": {
+    "model": "qwen3:32b",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ],
+    "stream": true
+  }
+}

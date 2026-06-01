@@ -1,0 +1,11 @@
+{
+  "model": "codellama:code",
+  "messages": [
+    { "role": "system", "content": "Return JSON only." },
+    { "role": "user", "content": "Say hello" }
+  ],
+  "stream": false,
+  "response_format": { "type": "json_object" },
+  "top_p": 0.9,
+  "seed": 7
+}

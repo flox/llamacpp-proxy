@@ -1,0 +1,15 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {"text": "hello"}
+      ]
+    }
+  ],
+  "generationConfig": {
+    "candidateCount": 3,
+    "temperature": 0.4,
+    "maxOutputTokens": 16
+  }
+}
