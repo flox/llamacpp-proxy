@@ -1825,7 +1825,7 @@ mod tests {
             let (mut fallback_socket, _) = listener.accept().await.unwrap();
             let fallback_request = read_captured_request(&mut fallback_socket).await;
             paths.push(fallback_request.path);
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
             paths
         });
@@ -2444,7 +2444,7 @@ mod tests {
         let (backend_base, handle) = spawn_ollama_fallback_timeout_backend().await;
         let state = test_state_with_backend_base_and_timeout(
             backend_base,
-            Duration::from_millis(20),
+            Duration::from_millis(500),
         );
 
         let response = health_response(&state).await;
