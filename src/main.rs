@@ -15,18 +15,19 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use llamacpp_proxy::{
     body_declares_stream, hardcoded_gemini_classification_response,
-    is_gemini_generation_path, is_gemini_request_body, is_gemini_stream_path,
-    is_ollama_chat_lifecycle_request, is_ollama_chat_path, is_ollama_delete_path,
+    is_gemini_generation_path, is_gemini_model_list_path, is_gemini_request_body,
+    is_gemini_stream_path, is_ollama_chat_lifecycle_request, is_ollama_chat_path, is_ollama_delete_path,
     is_ollama_generate_lifecycle_request, is_ollama_generate_path, is_ollama_pull_path,
     is_ollama_show_path, is_ollama_tags_path, ollama_delete_response,
     ollama_lifecycle_response, ollama_pull_response, ollama_request_declares_stream,
-    openai_chat_response_to_gemini, openai_response_to_ollama_with_context,
-    parse_json_body, protocol_error_body, protocol_for_path, protocol_for_request,
+    openai_chat_response_to_gemini, openai_models_to_gemini,
+    openai_response_to_ollama_with_context, parse_json_body, protocol_error_body,
+    protocol_for_path, protocol_for_request, sanitize_backend_request,
     rewrite_anthropic_messages_request_with_mode, rewrite_anthropic_messages_response,
     rewrite_anthropic_messages_sse_data, rewrite_gemini_request, rewrite_ollama_chat_request,
     rewrite_ollama_generate_request, rewrite_openai_responses_request,
     rewrite_openai_responses_response_with_mode, rewrite_openai_responses_sse_data_with_mode,
-    AnthropicSchemaMode, CodexNamespaceResponseMode, GeminiStreamAccumulator,
+    AnthropicSchemaMode, CodexNamespaceResponseMode, GeminiResponseKind, GeminiStreamAccumulator,
     OllamaResponseKind, OllamaStreamAccumulator, Protocol, ResponseRewriteState,
 };
 use serde_json::{json, Value};
@@ -158,7 +159,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Res
     let stream_response;
     let response_rewrite_state;
     let response_protocol;
-    let outgoing_body = match translate_request(&state, protocol, &path, &target_path, &body) {
+    let outgoing_body = match translate_request(&state, &method, protocol, &path, &target_path, &body) {
         Ok(TranslatedRequest::Forward {
             target,
             body,
@@ -219,7 +220,12 @@ fn translated_request_method(
     response_protocol: Protocol,
     state: &ResponseRewriteState,
 ) -> Method {
-    if response_protocol == Protocol::Ollama && state.ollama_response_kind == Some(OllamaResponseKind::Show) {
+    if (response_protocol == Protocol::Ollama
+        && state.ollama_response_kind == Some(OllamaResponseKind::Show))
+        || (response_protocol == Protocol::Gemini
+            && *original == Method::GET
+            && state.gemini_response_kind == Some(GeminiResponseKind::ListModels))
+    {
         Method::GET
     } else {
         original.clone()
@@ -261,7 +267,7 @@ fn log_translation_failure(
         error = %err,
         body_bytes = body.len(),
         raw_request_body = %raw_request_body,
-        "request translation failed; forwarding original request as-is"
+        "request translation failed; forwarding original request with JSON backend sanitization when possible"
     );
 }
 
@@ -280,7 +286,7 @@ fn translation_failure_passthrough(
 ) -> PassthroughFallback {
     PassthroughFallback {
         target: original_path_and_query.to_owned(),
-        body: body.clone(),
+        body: backend_compatible_body_bytes(body),
         stream: false,
         state: ResponseRewriteState::default(),
         response_protocol: Protocol::PassThrough,
@@ -289,6 +295,7 @@ fn translation_failure_passthrough(
 
 fn translate_request(
     state: &AppState,
+    method: &Method,
     protocol: Protocol,
     path: &str,
     path_and_query: &str,
@@ -305,7 +312,7 @@ fn translate_request(
             let (rewritten, rewrite_state) = rewrite_openai_responses_request(parsed);
             Ok(TranslatedRequest::Forward {
                 target: path_and_query.to_owned(),
-                body: json_bytes(&rewritten),
+                body: backend_json_bytes(rewritten),
                 stream,
                 state: rewrite_state,
                 response_protocol: Protocol::OpenAiResponses,
@@ -324,13 +331,33 @@ fn translate_request(
             );
             Ok(TranslatedRequest::Forward {
                 target: path_and_query.to_owned(),
-                body: json_bytes(&rewritten),
+                body: backend_json_bytes(rewritten),
                 stream,
                 state: ResponseRewriteState::default(),
                 response_protocol: Protocol::AnthropicMessages,
             })
         }
         Protocol::Gemini => {
+            if is_gemini_model_list_path(path) {
+                if *method == Method::GET {
+                    return Ok(TranslatedRequest::Forward {
+                        target: "/v1/models".to_owned(),
+                        body: Bytes::new(),
+                        stream: false,
+                        state: gemini_response_state(GeminiResponseKind::ListModels),
+                        response_protocol: Protocol::Gemini,
+                    });
+                }
+
+                return Ok(TranslatedRequest::Forward {
+                    target: path_and_query.to_owned(),
+                    body: backend_compatible_body_bytes(body),
+                    stream: false,
+                    state: ResponseRewriteState::default(),
+                    response_protocol: Protocol::PassThrough,
+                });
+            }
+
             let path_is_generation = is_gemini_generation_path(path);
             let parsed = match parse_json_body(body) {
                 Ok(value) => value,
@@ -354,7 +381,7 @@ fn translate_request(
                 }
                 return Ok(TranslatedRequest::Forward {
                     target: path_and_query.to_owned(),
-                    body: body.clone(),
+                    body: backend_compatible_json_bytes(body, parsed),
                     stream: false,
                     state: ResponseRewriteState::default(),
                     response_protocol: Protocol::PassThrough,
@@ -374,20 +401,20 @@ fn translate_request(
             let rewritten = rewrite_gemini_request(parsed, stream, &state.config.backend_model);
             Ok(TranslatedRequest::Forward {
                 target: "/v1/chat/completions".to_owned(),
-                body: json_bytes(&rewritten),
+                body: backend_json_bytes(rewritten),
                 stream,
-                state: ResponseRewriteState::default(),
+                state: gemini_response_state(GeminiResponseKind::GenerateContent),
                 response_protocol: Protocol::Gemini,
             })
         }
         Protocol::Ollama => translate_ollama_request(state, path, body),
         Protocol::OpenAiChat => {
-            let stream = parse_json_body(body)
-                .map(|value| body_declares_stream(&value))
-                .unwrap_or(false);
+            let parsed = parse_json_body(body).ok();
+            let stream = parsed.as_ref().is_some_and(body_declares_stream);
+            let body = parsed.map(backend_json_bytes).unwrap_or_else(|| body.clone());
             Ok(TranslatedRequest::Forward {
                 target: path_and_query.to_owned(),
-                body: body.clone(),
+                body,
                 stream,
                 state: ResponseRewriteState::default(),
                 response_protocol: Protocol::OpenAiChat,
@@ -395,7 +422,7 @@ fn translate_request(
         }
         Protocol::PassThrough => Ok(TranslatedRequest::Forward {
             target: path_and_query.to_owned(),
-            body: body.clone(),
+            body: backend_compatible_body_bytes(body),
             stream: false,
             state: ResponseRewriteState::default(),
             response_protocol: Protocol::PassThrough,
@@ -461,7 +488,7 @@ fn translate_ollama_request(
         let rewritten = rewrite_ollama_chat_request(parsed)?;
         return Ok(TranslatedRequest::Forward {
             target: "/v1/chat/completions".to_owned(),
-            body: json_bytes(&rewritten),
+            body: backend_json_bytes(rewritten),
             stream,
             state: ollama_response_state(OllamaResponseKind::Chat),
             response_protocol: Protocol::Ollama,
@@ -483,7 +510,7 @@ fn translate_ollama_request(
         let rewritten = rewrite_ollama_generate_request(parsed)?;
         return Ok(TranslatedRequest::Forward {
             target: "/v1/chat/completions".to_owned(),
-            body: json_bytes(&rewritten),
+            body: backend_json_bytes(rewritten),
             stream,
             state: ollama_response_state(OllamaResponseKind::Generate),
             response_protocol: Protocol::Ollama,
@@ -492,7 +519,7 @@ fn translate_ollama_request(
 
     Ok(TranslatedRequest::Forward {
         target: path.to_owned(),
-        body: body.clone(),
+        body: backend_compatible_json_bytes(body, parsed),
         stream: false,
         state: ResponseRewriteState::default(),
         response_protocol: Protocol::PassThrough,
@@ -502,6 +529,13 @@ fn translate_ollama_request(
 fn ollama_response_state(kind: OllamaResponseKind) -> ResponseRewriteState {
     ResponseRewriteState {
         ollama_response_kind: Some(kind),
+        ..ResponseRewriteState::default()
+    }
+}
+
+fn gemini_response_state(kind: GeminiResponseKind) -> ResponseRewriteState {
+    ResponseRewriteState {
+        gemini_response_kind: Some(kind),
         ..ResponseRewriteState::default()
     }
 }
@@ -602,6 +636,25 @@ fn ensure_object_with_any_key(
 
 fn json_bytes(value: &Value) -> Bytes {
     Bytes::from(serde_json::to_vec(value).expect("JSON serialization is infallible for Value"))
+}
+
+fn backend_json_bytes(value: Value) -> Bytes {
+    json_bytes(&sanitize_backend_request(value))
+}
+
+fn backend_compatible_json_bytes(original_body: &Bytes, value: Value) -> Bytes {
+    let sanitized = sanitize_backend_request(value.clone());
+    if sanitized == value {
+        original_body.clone()
+    } else {
+        json_bytes(&sanitized)
+    }
+}
+
+fn backend_compatible_body_bytes(body: &Bytes) -> Bytes {
+    parse_json_body(body)
+        .map(|value| backend_compatible_json_bytes(body, value))
+        .unwrap_or_else(|_| body.clone())
 }
 
 async fn forward_request(
@@ -727,6 +780,15 @@ async fn translate_response(
                         codex_namespace_response_mode,
                     )
                 })
+        }
+        Protocol::Gemini if state.gemini_response_kind == Some(GeminiResponseKind::ListModels) => {
+            serde_json::from_slice::<Value>(&body).map(|value| {
+                if status.is_success() {
+                    openai_models_to_gemini(value)
+                } else {
+                    openai_chat_response_to_gemini(value, status.as_u16())
+                }
+            })
         }
         Protocol::Gemini => serde_json::from_slice::<Value>(&body)
             .map(|value| openai_chat_response_to_gemini(value, status.as_u16())),
@@ -1337,50 +1399,161 @@ fn bytes_response(status: StatusCode, body: Bytes, content_type: HeaderValue) ->
 }
 
 async fn health_response(state: &AppState) -> Response<Body> {
-    let backend_uri = match backend_uri(&state.config.backend_base, "/health") {
-        Ok(uri) => uri,
-        Err(err) => {
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"status":"error","backend_ok":false,"error":format!("{err:?}")}),
-            );
-        }
+    let primary = match probe_backend(state, "/health").await {
+        Ok(probe) => probe,
+        Err(err) => return health_probe_error_response(err, "/health"),
     };
 
-    let request = match Request::builder()
-        .method(Method::GET)
-        .uri(backend_uri)
-        .body(Full::new(Bytes::new()))
-    {
-        Ok(request) => request,
-        Err(err) => {
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"status":"error","backend_ok":false,"error":err.to_string()}),
-            );
-        }
-    };
-
-    let result = timeout(state.config.backend_timeout, state.client.request(request)).await;
-    match result {
-        Ok(Ok(response)) if response.status().is_success() => json_response(
+    if primary.status.is_success() {
+        return json_response(
             StatusCode::OK,
-            json!({"status":"ok","backend_ok":true,"backend":state.config.backend_base}),
-        ),
-        Ok(Ok(response)) => json_response(
+            json!({
+                "status":"ok",
+                "backend_ok":true,
+                "backend":state.config.backend_base,
+                "backend_probe_method":"GET",
+                "backend_probe_path":"/health"
+            }),
+        );
+    }
+
+    if primary.status == StatusCode::NOT_FOUND {
+        let fallback = match probe_backend(state, "/").await {
+            Ok(probe) => probe,
+            Err(err) => {
+                return health_probe_error_response_with_primary(err, "/", primary.status);
+            }
+        };
+
+        if fallback.status == StatusCode::OK
+            && String::from_utf8_lossy(&fallback.body).contains("Ollama is running")
+        {
+            return json_response(
+                StatusCode::OK,
+                json!({
+                    "status":"ok",
+                    "backend_ok":true,
+                    "backend":state.config.backend_base,
+                    "backend_probe_method":"GET",
+                    "backend_probe_path":"/",
+                    "primary_backend_status":primary.status.as_u16()
+                }),
+            );
+        }
+
+        return json_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            json!({"status":"degraded","backend_ok":false,"backend_status":response.status().as_u16()}),
-        ),
-        Ok(Err(err)) => json_response(
+            json!({
+                "status":"degraded",
+                "backend_ok":false,
+                "backend_status":fallback.status.as_u16(),
+                "backend_probe_method":"GET",
+                "backend_probe_path":"/",
+                "primary_backend_status":primary.status.as_u16()
+            }),
+        );
+    }
+
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({
+            "status":"degraded",
+            "backend_ok":false,
+            "backend_status":primary.status.as_u16(),
+            "backend_probe_method":"GET",
+            "backend_probe_path":"/health"
+        }),
+    )
+}
+
+struct HealthProbe {
+    status: StatusCode,
+    body: Bytes,
+}
+
+async fn probe_backend(state: &AppState, path: &str) -> Result<HealthProbe, ProxyError> {
+    let uri = backend_uri(&state.config.backend_base, path)?;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+        .map_err(|err| ProxyError::BadGateway(format!("failed to build backend health request: {err}")))?;
+
+    let response = match timeout(state.config.backend_timeout, state.client.request(request)).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => return Err(ProxyError::BadGateway(format!("backend health check failed: {err}"))),
+        Err(_) => return Err(ProxyError::Timeout),
+    };
+    let status = response.status();
+    let body = match timeout(state.config.backend_timeout, response.into_body().collect()).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(err)) => {
+            return Err(ProxyError::BadGateway(format!(
+                "failed to read backend health response: {err}"
+            )));
+        }
+        Err(_) => return Err(ProxyError::Timeout),
+    };
+
+    Ok(HealthProbe { status, body })
+}
+
+fn health_probe_error_response(err: ProxyError, path: &str) -> Response<Body> {
+    match err {
+        ProxyError::BadGateway(message) => json_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            json!({"status":"degraded","backend_ok":false,"error":err.to_string()}),
+            json!({
+                "status":"degraded",
+                "backend_ok":false,
+                "error":message,
+                "backend_probe_method":"GET",
+                "backend_probe_path":path
+            }),
         ),
-        Err(_) => json_response(
+        ProxyError::Timeout => json_response(
             StatusCode::GATEWAY_TIMEOUT,
-            json!({"status":"degraded","backend_ok":false,"error":"backend health check timed out"}),
+            json!({
+                "status":"degraded",
+                "backend_ok":false,
+                "error":"backend health check timed out",
+                "backend_probe_method":"GET",
+                "backend_probe_path":path
+            }),
         ),
     }
 }
+
+fn health_probe_error_response_with_primary(
+    err: ProxyError,
+    path: &str,
+    primary_status: StatusCode,
+) -> Response<Body> {
+    match err {
+        ProxyError::BadGateway(message) => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "status":"degraded",
+                "backend_ok":false,
+                "error":message,
+                "backend_probe_method":"GET",
+                "backend_probe_path":path,
+                "primary_backend_status":primary_status.as_u16()
+            }),
+        ),
+        ProxyError::Timeout => json_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            json!({
+                "status":"degraded",
+                "backend_ok":false,
+                "error":"backend health check timed out",
+                "backend_probe_method":"GET",
+                "backend_probe_path":path,
+                "primary_backend_status":primary_status.as_u16()
+            }),
+        ),
+    }
+}
+
 
 impl Config {
     fn parse() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -1482,6 +1655,7 @@ Options:\n  --listen <ADDR:PORT>                 Proxy listen address [default: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 
     fn test_state() -> AppState {
@@ -1504,6 +1678,223 @@ mod tests {
         }
     }
 
+    fn test_state_with_backend_base(backend_base: String) -> AppState {
+        let mut state = test_state();
+        let mut config = (*state.config).clone();
+        config.backend_base = backend_base;
+        state.config = Arc::new(config);
+        state
+    }
+
+    async fn response_json(response: Response<Body>) -> Value {
+        let body = to_bytes(response.into_body(), DEFAULT_MAX_BODY_BYTES).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn spawn_http_backend(
+        responses: Vec<(StatusCode, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0_u8; 1024];
+                    let read = socket.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request_text = String::from_utf8_lossy(&request);
+                let path = request_text
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_owned();
+                paths.push(path);
+                let response = format!(
+                    "HTTP/1.1 {} OK\r\ncontent-length: {}\r\nconnection: close\r\ncontent-type: text/plain\r\n\r\n{}",
+                    status.as_u16(),
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            paths
+        });
+        (format!("http://{addr}"), handle)
+    }
+    #[derive(Debug)]
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        body: Bytes,
+    }
+
+    async fn read_captured_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut buf = [0_u8; 1024];
+            let read = socket.read(&mut buf).await.unwrap();
+            if read == 0 {
+                break request.len();
+            }
+            request.extend_from_slice(&buf[..read]);
+            if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let mut lines = headers.lines();
+        let request_line = lines.next().unwrap_or_default();
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().unwrap_or_default().to_owned();
+        let path = request_parts.next().unwrap_or_default().to_owned();
+        let mut content_length = 0_usize;
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse::<usize>().unwrap_or_default();
+                    break;
+                }
+            }
+        }
+
+        let mut body = request[header_end..].to_vec();
+        while body.len() < content_length {
+            let mut buf = vec![0_u8; content_length - body.len()];
+            let read = socket.read(&mut buf).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..read]);
+        }
+        body.truncate(content_length);
+
+        CapturedRequest {
+            method,
+            path,
+            body: Bytes::from(body),
+        }
+    }
+
+    async fn spawn_capturing_json_backend(
+        responses: Vec<(StatusCode, &'static str)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<CapturedRequest>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_captured_request(&mut socket).await);
+                let response = format!(
+                    "HTTP/1.1 {} OK\r\ncontent-length: {}\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{}",
+                    status.as_u16(),
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_ollama_fallback_timeout_backend() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut paths = Vec::new();
+
+            let (mut health_socket, _) = listener.accept().await.unwrap();
+            let health_request = read_captured_request(&mut health_socket).await;
+            paths.push(health_request.path);
+            let health_response = "HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\nconnection: close\r\ncontent-type: text/plain\r\n\r\nnot found";
+            health_socket.write_all(health_response.as_bytes()).await.unwrap();
+
+            let (mut fallback_socket, _) = listener.accept().await.unwrap();
+            let fallback_request = read_captured_request(&mut fallback_socket).await;
+            paths.push(fallback_request.path);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            paths
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn test_state_with_backend_base_and_timeout(backend_base: String, backend_timeout: Duration) -> AppState {
+        let mut state = test_state_with_backend_base(backend_base);
+        let mut config = (*state.config).clone();
+        config.backend_timeout = backend_timeout;
+        state.config = Arc::new(config);
+        state
+    }
+
+    fn json_proxy_request(method: Method, uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(json_bytes(&body)))
+            .unwrap()
+    }
+
+    fn openai_chat_completion_success() -> &'static str {
+        r#"{
+            "id":"chatcmpl-test",
+            "object":"chat.completion",
+            "created":0,
+            "model":"local-model",
+            "choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":"ok"},
+                "finish_reason":"stop"
+            }],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+        }"#
+    }
+
+    fn assert_backend_body_sanitized(protocol_name: &str, body: &Bytes) -> Value {
+        let parsed: Value = serde_json::from_slice(body)
+            .unwrap_or_else(|err| panic!("{protocol_name} backend body should be JSON: {err}"));
+        assert!(
+            parsed.get("reasoning_effort").is_none(),
+            "{protocol_name} leaked reasoning_effort: {parsed}"
+        );
+        assert!(
+            parsed.get("thinking").is_none(),
+            "{protocol_name} leaked thinking: {parsed}"
+        );
+        assert!(
+            parsed.get("max_completion_tokens").is_none(),
+            "{protocol_name} leaked max_completion_tokens: {parsed}"
+        );
+        if let Some(messages) = parsed.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                assert!(
+                    message.get("reasoning_content").is_none(),
+                    "{protocol_name} leaked message reasoning_content: {parsed}"
+                );
+                assert!(
+                    message.get("reasoning").is_none(),
+                    "{protocol_name} leaked message reasoning: {parsed}"
+                );
+            }
+        }
+        parsed
+    }
+
+
     fn observed_ollama_request(raw: &str) -> (Method, String, Bytes) {
         let root: Value = serde_json::from_str(raw).unwrap();
         let method = Method::from_bytes(root["method"].as_str().unwrap().as_bytes()).unwrap();
@@ -1522,6 +1913,7 @@ mod tests {
         let body = Bytes::from_static(br#"{"ordinary":true}"#);
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::Gemini,
             "/gemini/unknown",
             "/gemini/unknown",
@@ -1549,7 +1941,525 @@ mod tests {
     }
 
     #[test]
-    fn translation_failure_fallback_forwards_original_request_as_is() {
+    fn gemini_model_list_routes_to_openai_models_endpoint() {
+        let state = test_state();
+        let translated = translate_request(
+            &state,
+            &Method::GET,
+            Protocol::Gemini,
+            "/v1beta/models",
+            "/v1beta/models?pageSize=10",
+            &Bytes::new(),
+        )
+        .unwrap();
+
+        match translated {
+            TranslatedRequest::Forward {
+                target,
+                body,
+                stream,
+                state,
+                response_protocol,
+            } => {
+                assert_eq!(target, "/v1/models");
+                assert!(body.is_empty());
+                assert!(!stream);
+                assert_eq!(state.gemini_response_kind, Some(GeminiResponseKind::ListModels));
+                assert_eq!(response_protocol, Protocol::Gemini);
+                assert_eq!(
+                    translated_request_method(&Method::GET, response_protocol, &state),
+                    Method::GET
+                );
+            }
+            TranslatedRequest::Immediate { .. } | TranslatedRequest::ImmediateRaw { .. } => {
+                panic!("Gemini model listing should query backend models")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_translates_gemini_model_list_response_end_to_end() {
+        let backend_response = r#"{
+            "object":"list",
+            "next_page_token":"cursor-2",
+            "data":[
+                {
+                    "id":"registry.local/team/qwen3:8b",
+                    "display_name":"Qwen 3 8B Local",
+                    "meta":{"description":"local registry model","input_token_limit":8192}
+                },
+                {"id":"models/org/nested/model-name"}
+            ]
+        }"#;
+        let (backend_base, handle) =
+            spawn_capturing_json_backend(vec![(StatusCode::OK, backend_response)]).await;
+        let state = test_state_with_backend_base(backend_base);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1beta/models?pageSize=10")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = proxy_handler(State(state), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["nextPageToken"], "cursor-2");
+        assert_eq!(body["models"][0]["name"], "models/registry.local/team/qwen3:8b");
+        assert_eq!(body["models"][0]["displayName"], "Qwen 3 8B Local");
+        assert_eq!(body["models"][0]["description"], "local registry model");
+        assert_eq!(body["models"][0]["inputTokenLimit"], 8192);
+        assert_eq!(
+            body["models"][0]["supportedGenerationMethods"],
+            json!(["generateContent", "streamGenerateContent"])
+        );
+        assert_eq!(body["models"][1]["name"], "models/org/nested/model-name");
+
+        let captured = handle.await.unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].method, "GET");
+        assert_eq!(captured[0].path, "/v1/models");
+        assert!(captured[0].body.is_empty());
+    }
+
+    #[test]
+    fn gemini_model_list_non_get_does_not_route_to_backend_models() {
+        let state = test_state();
+        let body = Bytes::from_static(br#"{
+            "reasoning_effort":"low",
+            "max_completion_tokens":7,
+            "messages":[{
+                "role":"assistant",
+                "content":"hi",
+                "reasoning_content":"hidden"
+            }]
+        }"#);
+        let translated = translate_request(
+            &state,
+            &Method::POST,
+            Protocol::Gemini,
+            "/v1beta/models",
+            "/v1beta/models?pageSize=10",
+            &body,
+        )
+        .unwrap();
+
+        match translated {
+            TranslatedRequest::Forward {
+                target,
+                body,
+                stream,
+                state,
+                response_protocol,
+            } => {
+                assert_eq!(target, "/v1beta/models?pageSize=10");
+                assert!(!stream);
+                assert_eq!(state.gemini_response_kind, None);
+                assert_eq!(response_protocol, Protocol::PassThrough);
+                assert_eq!(
+                    translated_request_method(
+                        &Method::POST,
+                        Protocol::Gemini,
+                        &gemini_response_state(GeminiResponseKind::ListModels),
+                    ),
+                    Method::POST
+                );
+
+                let parsed: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(parsed["max_tokens"], 7);
+                assert!(parsed.get("max_completion_tokens").is_none());
+                assert!(parsed.get("reasoning_effort").is_none());
+                assert!(parsed["messages"][0].get("reasoning_content").is_none());
+            }
+            TranslatedRequest::Immediate { .. } | TranslatedRequest::ImmediateRaw { .. } => {
+                panic!("non-GET Gemini model-list path should pass through")
+            }
+        }
+    }
+
+    #[test]
+    fn openai_chat_requests_are_sanitized_before_forwarding() {
+        let state = test_state();
+        let body = Bytes::from_static(br#"{
+            "model":"local",
+            "stream":true,
+            "reasoning_effort":"high",
+            "thinking":{"type":"enabled"},
+            "max_completion_tokens":32,
+            "messages":[{
+                "role":"assistant",
+                "content":"hello",
+                "reasoning_content":"hidden",
+                "reasoning":{"text":"hidden"}
+            }]
+        }"#);
+
+        let TranslatedRequest::Forward { body, stream, .. } = translate_request(
+            &state,
+            &Method::POST,
+            Protocol::OpenAiChat,
+            "/v1/chat/completions",
+            "/v1/chat/completions",
+            &body,
+        )
+        .unwrap() else {
+            panic!("OpenAI Chat request should forward");
+        };
+
+        assert!(stream);
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["max_tokens"], 32);
+        assert!(parsed.get("max_completion_tokens").is_none());
+        assert!(parsed.get("reasoning_effort").is_none());
+        assert!(parsed.get("thinking").is_none());
+        assert!(parsed["messages"][0].get("reasoning_content").is_none());
+        assert!(parsed["messages"][0].get("reasoning").is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_sanitizes_backend_requests_for_all_translated_protocols() {
+        let cases = [
+            (
+                "openai chat",
+                "/v1/chat/completions",
+                json!({
+                    "model":"local",
+                    "stream":false,
+                    "reasoning_effort":"high",
+                    "thinking":{"type":"enabled"},
+                    "max_completion_tokens":21,
+                    "messages":[{
+                        "role":"assistant",
+                        "content":"hello",
+                        "reasoning_content":"hidden",
+                        "reasoning":{"text":"hidden"}
+                    }]
+                }),
+                "/v1/chat/completions",
+                21,
+            ),
+            (
+                "openai responses",
+                "/v1/responses",
+                json!({
+                    "model":"local",
+                    "input":"hello",
+                    "reasoning_effort":"high",
+                    "thinking":{"type":"enabled"},
+                    "max_completion_tokens":22,
+                    "messages":[{
+                        "role":"assistant",
+                        "content":"hello",
+                        "reasoning_content":"hidden",
+                        "reasoning":{"text":"hidden"}
+                    }]
+                }),
+                "/v1/responses",
+                22,
+            ),
+            (
+                "anthropic",
+                "/v1/messages",
+                json!({
+                    "model":"local",
+                    "max_tokens":64,
+                    "reasoning_effort":"high",
+                    "thinking":{"type":"enabled"},
+                    "max_completion_tokens":23,
+                    "messages":[{
+                        "role":"assistant",
+                        "content":"hello",
+                        "reasoning_content":"hidden",
+                        "reasoning":{"text":"hidden"}
+                    }]
+                }),
+                "/v1/messages",
+                64,
+            ),
+            (
+                "gemini",
+                "/v1beta/models/gemini-2.5-flash:generateContent",
+                json!({
+                    "reasoning_effort":"high",
+                    "thinking":{"type":"enabled"},
+                    "max_completion_tokens":24,
+                    "contents":[{"role":"user","parts":[{"text":"hello"}]}],
+                    "generationConfig":{"maxOutputTokens":24}
+                }),
+                "/v1/chat/completions",
+                24,
+            ),
+            (
+                "ollama",
+                "/api/chat",
+                json!({
+                    "model":"local",
+                    "stream":false,
+                    "reasoning_effort":"high",
+                    "thinking":{"type":"enabled"},
+                    "max_completion_tokens":25,
+                    "messages":[{
+                        "role":"assistant",
+                        "content":"hello",
+                        "reasoning_content":"hidden",
+                        "reasoning":{"text":"hidden"}
+                    }],
+                    "options":{"num_predict":25}
+                }),
+                "/v1/chat/completions",
+                25,
+            ),
+        ];
+
+        for (protocol_name, uri, request_body, expected_backend_path, expected_max_tokens) in cases {
+            let (backend_base, handle) = spawn_capturing_json_backend(vec![(
+                StatusCode::OK,
+                openai_chat_completion_success(),
+            )])
+            .await;
+            let state = test_state_with_backend_base(backend_base);
+            let request = json_proxy_request(Method::POST, uri, request_body);
+
+            let response = proxy_handler(State(state), request).await;
+            assert!(
+                response.status().is_success(),
+                "{protocol_name} proxy response was {}",
+                response.status()
+            );
+
+            let captured = handle.await.unwrap();
+            assert_eq!(captured.len(), 1, "{protocol_name} should send one backend request");
+            assert_eq!(captured[0].method, "POST", "{protocol_name} backend method");
+            assert_eq!(
+                captured[0].path, expected_backend_path,
+                "{protocol_name} backend path"
+            );
+            let parsed = assert_backend_body_sanitized(protocol_name, &captured[0].body);
+            assert_eq!(
+                parsed["max_tokens"], expected_max_tokens,
+                "{protocol_name} max_tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn pass_through_protocol_sanitizes_json_before_forwarding() {
+        let state = test_state();
+        let body = Bytes::from_static(br#"{
+            "model":"local",
+            "reasoning_effort":"medium",
+            "thinking":{"budget_tokens":128},
+            "max_completion_tokens":24,
+            "messages":[{
+                "role":"assistant",
+                "content":"hi",
+                "reasoning_content":"hidden",
+                "reasoning":{"trace":"hidden"}
+            }]
+        }"#);
+
+        let TranslatedRequest::Forward {
+            body,
+            response_protocol,
+            ..
+        } = translate_request(
+            &state,
+            &Method::POST,
+            Protocol::PassThrough,
+            "/custom/proxy",
+            "/custom/proxy",
+            &body,
+        )
+        .unwrap() else {
+            panic!("pass-through request should forward");
+        };
+
+        assert_eq!(response_protocol, Protocol::PassThrough);
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["max_tokens"], 24);
+        assert!(parsed.get("max_completion_tokens").is_none());
+        assert!(parsed.get("reasoning_effort").is_none());
+        assert!(parsed.get("thinking").is_none());
+        assert!(parsed["messages"][0].get("reasoning_content").is_none());
+        assert!(parsed["messages"][0].get("reasoning").is_none());
+    }
+
+    #[test]
+    fn pass_through_protocol_preserves_malformed_non_json_body() {
+        let state = test_state();
+        let body = Bytes::from_static(b"not json but still pass through");
+
+        let TranslatedRequest::Forward {
+            body: forwarded_body,
+            response_protocol,
+            ..
+        } = translate_request(
+            &state,
+            &Method::POST,
+            Protocol::PassThrough,
+            "/custom/proxy",
+            "/custom/proxy",
+            &body,
+        )
+        .unwrap() else {
+            panic!("pass-through request should forward");
+        };
+
+        assert_eq!(response_protocol, Protocol::PassThrough);
+        assert_eq!(forwarded_body, body);
+    }
+
+    #[tokio::test]
+    async fn proxy_sanitizes_pass_through_and_translation_failure_fallback_requests() {
+        let cases = [
+            (
+                "pass-through",
+                "/custom/proxy?x=1",
+                json!({
+                    "ordinary":true,
+                    "reasoning_effort":"medium",
+                    "thinking":{"budget_tokens":128},
+                    "max_completion_tokens":31,
+                    "messages":[{
+                        "role":"assistant",
+                        "content":"hi",
+                        "reasoning_content":"hidden",
+                        "reasoning":{"trace":"hidden"}
+                    }]
+                }),
+                "/custom/proxy?x=1",
+                31,
+            ),
+            (
+                "translation failure fallback",
+                "/v1/responses?x=1",
+                json!({
+                    "unexpected":true,
+                    "reasoning_effort":"medium",
+                    "thinking":{"budget_tokens":128},
+                    "max_completion_tokens":32,
+                    "messages":[{
+                        "role":"assistant",
+                        "content":"hi",
+                        "reasoning_content":"hidden",
+                        "reasoning":{"trace":"hidden"}
+                    }]
+                }),
+                "/v1/responses?x=1",
+                32,
+            ),
+        ];
+
+        for (case_name, uri, request_body, expected_backend_path, expected_max_tokens) in cases {
+            let (backend_base, handle) =
+                spawn_capturing_json_backend(vec![(StatusCode::OK, r#"{"ok":true}"#)]).await;
+            let state = test_state_with_backend_base(backend_base);
+            let response = proxy_handler(
+                State(state),
+                json_proxy_request(Method::POST, uri, request_body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{case_name} status");
+
+            let captured = handle.await.unwrap();
+            assert_eq!(captured.len(), 1, "{case_name} backend request count");
+            assert_eq!(captured[0].path, expected_backend_path, "{case_name} backend path");
+            let parsed = assert_backend_body_sanitized(case_name, &captured[0].body);
+            assert_eq!(parsed["max_tokens"], expected_max_tokens, "{case_name} max_tokens");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_response_reports_primary_probe_path() {
+        let (backend_base, handle) = spawn_http_backend(vec![(StatusCode::OK, "healthy")]).await;
+        let state = test_state_with_backend_base(backend_base);
+
+        let response = health_response(&state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["backend_ok"], true);
+        assert_eq!(body["backend_probe_method"], "GET");
+        assert_eq!(body["backend_probe_path"], "/health");
+        assert_eq!(handle.await.unwrap(), vec!["/health".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn health_response_falls_back_to_ollama_root_after_health_404() {
+        let (backend_base, handle) = spawn_http_backend(vec![
+            (StatusCode::NOT_FOUND, "not found"),
+            (StatusCode::OK, "Ollama is running"),
+        ])
+        .await;
+        let state = test_state_with_backend_base(backend_base);
+
+        let response = health_response(&state).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["backend_ok"], true);
+        assert_eq!(body["backend_probe_method"], "GET");
+        assert_eq!(body["backend_probe_path"], "/");
+        assert_eq!(body["primary_backend_status"], 404);
+        assert_eq!(handle.await.unwrap(), vec!["/health".to_owned(), "/".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn health_response_does_not_accept_non_ollama_root_body() {
+        let (backend_base, handle) = spawn_http_backend(vec![
+            (StatusCode::NOT_FOUND, "not found"),
+            (StatusCode::OK, "not ollama"),
+        ])
+        .await;
+        let state = test_state_with_backend_base(backend_base);
+
+        let response = health_response(&state).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["backend_ok"], false);
+        assert_eq!(body["backend_status"], 200);
+        assert_eq!(body["backend_probe_path"], "/");
+        assert_eq!(body["primary_backend_status"], 404);
+        assert_eq!(handle.await.unwrap(), vec!["/health".to_owned(), "/".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn health_response_reports_primary_probe_connection_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let state = test_state_with_backend_base(format!("http://{addr}"));
+
+        let response = health_response(&state).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["backend_ok"], false);
+        assert_eq!(body["backend_probe_method"], "GET");
+        assert_eq!(body["backend_probe_path"], "/health");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("backend health check failed"));
+    }
+
+    #[tokio::test]
+    async fn health_response_reports_fallback_probe_timeout_after_primary_404() {
+        let (backend_base, handle) = spawn_ollama_fallback_timeout_backend().await;
+        let state = test_state_with_backend_base_and_timeout(
+            backend_base,
+            Duration::from_millis(20),
+        );
+
+        let response = health_response(&state).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = response_json(response).await;
+        assert_eq!(body["backend_ok"], false);
+        assert_eq!(body["backend_probe_method"], "GET");
+        assert_eq!(body["backend_probe_path"], "/");
+        assert_eq!(body["primary_backend_status"], 404);
+        assert_eq!(body["error"], "backend health check timed out");
+        assert_eq!(handle.await.unwrap(), vec!["/health".to_owned(), "/".to_owned()]);
+    }
+
+    #[test]
+    fn translation_failure_fallback_preserves_json_without_backend_incompatible_fields() {
         let body = Bytes::from_static(br#"{"bad":"shape"}"#);
         let fallback = translation_failure_passthrough("/v1/messages?x=1", &body);
         assert_eq!(fallback.target, "/v1/messages?x=1");
@@ -1561,11 +2471,74 @@ mod tests {
     }
 
     #[test]
+    fn translation_failure_fallback_sanitizes_json_before_forwarding() {
+        let body = Bytes::from_static(br#"{
+            "unexpected":true,
+            "reasoning_effort":"high",
+            "thinking":{"type":"enabled"},
+            "max_completion_tokens":9,
+            "messages":[{
+                "role":"assistant",
+                "content":"hi",
+                "reasoning_content":"hidden",
+                "reasoning":"hidden"
+            }]
+        }"#);
+
+        let fallback = translation_failure_passthrough("/v1/messages?x=1", &body);
+        assert_eq!(fallback.target, "/v1/messages?x=1");
+        assert_eq!(fallback.response_protocol, Protocol::PassThrough);
+
+        let parsed: Value = serde_json::from_slice(&fallback.body).unwrap();
+        assert_eq!(parsed["max_tokens"], 9);
+        assert!(parsed.get("max_completion_tokens").is_none());
+        assert!(parsed.get("reasoning_effort").is_none());
+        assert!(parsed.get("thinking").is_none());
+        assert!(parsed["messages"][0].get("reasoning_content").is_none());
+        assert!(parsed["messages"][0].get("reasoning").is_none());
+    }
+
+    #[test]
+    fn gemini_non_generation_passthrough_sanitizes_json_before_forwarding() {
+        let state = test_state();
+        let body = Bytes::from_static(br#"{
+            "ordinary":true,
+            "reasoning_effort":"low",
+            "max_completion_tokens":11
+        }"#);
+        let translated = translate_request(
+            &state,
+            &Method::POST,
+            Protocol::Gemini,
+            "/gemini/unknown",
+            "/gemini/unknown",
+            &body,
+        )
+        .unwrap();
+
+        let TranslatedRequest::Forward {
+            body,
+            response_protocol,
+            ..
+        } = translated else {
+            panic!("non-generation Gemini path should pass through");
+        };
+
+        assert_eq!(response_protocol, Protocol::PassThrough);
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["ordinary"], true);
+        assert_eq!(parsed["max_tokens"], 11);
+        assert!(parsed.get("max_completion_tokens").is_none());
+        assert!(parsed.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn well_formed_unexpected_responses_json_uses_fallback_path() {
         let state = test_state();
         let body = Bytes::from_static(br#"{"unexpected":true}"#);
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::OpenAiResponses,
             "/v1/responses",
             "/v1/responses",
@@ -1583,6 +2556,7 @@ mod tests {
         let body = Bytes::from_static(br#"{"unexpected":true}"#);
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::AnthropicMessages,
             "/v1/messages",
             "/v1/messages",
@@ -1615,6 +2589,7 @@ mod tests {
         }"#);
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::AnthropicMessages,
             "/v1/messages",
             "/v1/messages",
@@ -1646,6 +2621,7 @@ mod tests {
         let body = Bytes::from_static(br#"{"model":"local","messages":[{"role":"user","content":"hello"}],"max_tokens":16}"#);
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::AnthropicMessages,
             "/v1/messages",
             "/v1/messages",
@@ -1674,6 +2650,7 @@ mod tests {
         let body = Bytes::from_static(b"{not json");
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::OpenAiResponses,
             "/v1/responses",
             "/v1/responses",
@@ -1699,6 +2676,7 @@ mod tests {
         let body = Bytes::from_static(b"{not json");
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::AnthropicMessages,
             "/v1/messages",
             "/v1/messages",
@@ -1725,6 +2703,7 @@ mod tests {
         let body = Bytes::from_static(b"{not json");
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::Gemini,
             "/v1beta/models/gemini-2.5-flash:generateContent",
             "/v1beta/models/gemini-2.5-flash:generateContent",
@@ -1751,6 +2730,7 @@ mod tests {
         let body = Bytes::from_static(br#"{"unexpected":true}"#);
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::Gemini,
             "/v1beta/models/gemini-2.5-flash:generateContent",
             "/v1beta/models/gemini-2.5-flash:generateContent?alt=sse",
@@ -1776,6 +2756,7 @@ mod tests {
         let body = Bytes::from_static(b"{not json");
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::Gemini,
             "/gemini/unknown",
             "/gemini/unknown",
@@ -1799,6 +2780,43 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn ollama_unknown_path_passthrough_sanitizes_json_before_forwarding() {
+        let state = test_state();
+        let body = Bytes::from_static(br#"{
+            "model":"local",
+            "reasoning_effort":"medium",
+            "thinking":true,
+            "max_completion_tokens":17
+        }"#);
+
+        let translated = translate_request(
+            &state,
+            &Method::POST,
+            Protocol::Ollama,
+            "/api/unknown",
+            "/api/unknown",
+            &body,
+        )
+        .unwrap();
+
+        let TranslatedRequest::Forward {
+            body,
+            response_protocol,
+            ..
+        } = translated else {
+            panic!("unknown Ollama path should pass through");
+        };
+
+        assert_eq!(response_protocol, Protocol::PassThrough);
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["max_tokens"], 17);
+        assert!(parsed.get("max_completion_tokens").is_none());
+        assert!(parsed.get("reasoning_effort").is_none());
+        assert!(parsed.get("thinking").is_none());
+    }
+
     #[test]
     fn anthropic_sse_rewrite_preserves_event_name() {
         let event = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\",\"text\":\"hi\"}}";
@@ -1820,6 +2838,7 @@ mod tests {
         }"#);
         let translated = translate_request(
             &test_state(),
+            &Method::POST,
             Protocol::OpenAiResponses,
             "/v1/responses",
             "/v1/responses",
@@ -1875,7 +2894,7 @@ mod tests {
     fn ollama_chat_translates_to_openai_chat_and_defaults_streaming() {
         let state = test_state();
         let body = Bytes::from_static(br#"{"model":"qwen3:32b","messages":[{"role":"user","content":"hello"}]}"#);
-        let translated = translate_request(&state, Protocol::Ollama, "/api/chat", "/api/chat", &body).unwrap();
+        let translated = translate_request(&state, &Method::POST, Protocol::Ollama, "/api/chat", "/api/chat", &body).unwrap();
 
         match translated {
             TranslatedRequest::Forward {
@@ -1905,6 +2924,7 @@ mod tests {
         let state = test_state();
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::Ollama,
             "/api/tags",
             "/api/tags",
@@ -1936,7 +2956,7 @@ mod tests {
     fn ollama_show_queries_backend_models_with_get() {
         let state = test_state();
         let body = Bytes::from_static(br#"{"model":"qwen3:32b"}"#);
-        let translated = translate_request(&state, Protocol::Ollama, "/api/show", "/api/show", &body).unwrap();
+        let translated = translate_request(&state, &Method::POST, Protocol::Ollama, "/api/show", "/api/show", &body).unwrap();
 
         match translated {
             TranslatedRequest::Forward {
@@ -1967,7 +2987,7 @@ mod tests {
     fn ollama_pull_defaults_to_ndjson_synthetic_success() {
         let state = test_state();
         let body = Bytes::from_static(br#"{"model":"qwen3:32b"}"#);
-        let translated = translate_request(&state, Protocol::Ollama, "/api/pull", "/api/pull", &body).unwrap();
+        let translated = translate_request(&state, &Method::POST, Protocol::Ollama, "/api/pull", "/api/pull", &body).unwrap();
 
         match translated {
             TranslatedRequest::ImmediateRaw {
@@ -1999,7 +3019,7 @@ mod tests {
             include_str!("../fixtures/ollama/observed/js_0_6_3_show.request.json"),
         ] {
             let (method, path, body) = observed_ollama_request(raw);
-            let translated = translate_request(&state, Protocol::Ollama, &path, &path, &body).unwrap();
+            let translated = translate_request(&state, &method, Protocol::Ollama, &path, &path, &body).unwrap();
             match translated {
                 TranslatedRequest::Forward {
                     target,
@@ -2035,7 +3055,7 @@ mod tests {
             include_str!("../fixtures/ollama/observed/js_0_6_3_delete.request.json"),
         ] {
             let (_method, path, body) = observed_ollama_request(raw);
-            let translated = translate_request(&state, Protocol::Ollama, &path, &path, &body).unwrap();
+            let translated = translate_request(&state, &Method::POST, Protocol::Ollama, &path, &path, &body).unwrap();
             match translated {
                 TranslatedRequest::Immediate { status, body } => {
                     assert_eq!(status, StatusCode::OK);
@@ -2078,7 +3098,7 @@ mod tests {
         ] {
             let (_method, path, body) = observed_ollama_request(raw);
             let expected: Value = serde_json::from_str(expected_raw).unwrap();
-            let translated = translate_request(&state, Protocol::Ollama, &path, &path, &body).unwrap();
+            let translated = translate_request(&state, &Method::POST, Protocol::Ollama, &path, &path, &body).unwrap();
             match translated {
                 TranslatedRequest::Forward { target, body, stream, .. } => {
                     assert_eq!(target, "/v1/chat/completions");
@@ -2098,6 +3118,7 @@ mod tests {
         let state = test_state();
         let translated = translate_request(
             &state,
+            &Method::POST,
             Protocol::Ollama,
             "/api/chat",
             "/api/chat",

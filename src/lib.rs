@@ -23,6 +23,8 @@ pub struct ResponseRewriteState {
     /// Original model requested by an Ollama endpoint when a later backend discovery
     /// response must be reshaped for that model.
     pub ollama_requested_model: Option<String>,
+    /// Gemini response shape requested by inbound Gemini-compatible endpoints.
+    pub gemini_response_kind: Option<GeminiResponseKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,12 @@ pub enum OllamaResponseKind {
     Generate,
     Tags,
     Show,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiResponseKind {
+    GenerateContent,
+    ListModels,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +161,7 @@ pub fn protocol_for_request(path: &str, body: &[u8]) -> Protocol {
 }
 
 pub fn is_gemini_path(path: &str) -> bool {
-    path.starts_with("/v1beta/models/") || path.starts_with("/gemini/")
+    is_gemini_model_list_path(path) || path.starts_with("/v1beta/models/") || path.starts_with("/gemini/")
 }
 
 pub fn is_ollama_path(path: &str) -> bool {
@@ -185,6 +193,10 @@ pub fn is_ollama_pull_path(path: &str) -> bool {
 
 pub fn is_ollama_delete_path(path: &str) -> bool {
     path == "/api/delete"
+}
+
+pub fn is_gemini_model_list_path(path: &str) -> bool {
+    path == "/v1beta/models" || path == "/gemini/v1beta/models"
 }
 
 pub fn is_gemini_stream_path(path: &str) -> bool {
@@ -1998,6 +2010,124 @@ fn copy_value(src: &Map<String, Value>, dst: &mut Map<String, Value>, key: &str)
     }
 }
 
+pub fn sanitize_backend_request(mut root: Value) -> Value {
+    let Some(obj) = root.as_object_mut() else {
+        return root;
+    };
+
+    obj.remove("reasoning_effort");
+    obj.remove("thinking");
+
+    if let Some(max_completion_tokens) = obj.remove("max_completion_tokens") {
+        if !obj.contains_key("max_tokens") {
+            obj.insert("max_tokens".to_owned(), max_completion_tokens);
+        }
+    }
+
+    if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            let Some(message_obj) = message.as_object_mut() else {
+                continue;
+            };
+            message_obj.remove("reasoning_content");
+            message_obj.remove("reasoning");
+        }
+    }
+
+    root
+}
+
+pub fn openai_models_to_gemini(root: Value) -> Value {
+    let models: Vec<Value> = root
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|records| records.iter().filter_map(openai_model_record_to_gemini).collect())
+        .unwrap_or_default();
+
+    let mut out = Map::new();
+    out.insert("models".to_owned(), Value::Array(models));
+    if let Some(next_page_token) = root.get("nextPageToken").or_else(|| root.get("next_page_token")) {
+        out.insert("nextPageToken".to_owned(), next_page_token.clone());
+    }
+    Value::Object(out)
+}
+
+fn openai_model_record_to_gemini(record: &Value) -> Option<Value> {
+    let id = record
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| record.get("name").and_then(Value::as_str))?
+        .trim();
+    if id.is_empty() {
+        return None;
+    }
+
+    let model_id = id.strip_prefix("models/").unwrap_or(id);
+    if model_id.is_empty() {
+        return None;
+    }
+
+    let mut model = Map::new();
+    model.insert("name".to_owned(), Value::String(format!("models/{model_id}")));
+    model.insert(
+        "displayName".to_owned(),
+        Value::String(gemini_display_name(record, model_id)),
+    );
+    model.insert(
+        "supportedGenerationMethods".to_owned(),
+        json!(["generateContent", "streamGenerateContent"]),
+    );
+
+    if let Some(value) = record.get("created").and_then(model_version_from_created) {
+        model.insert("version".to_owned(), Value::String(value));
+    }
+    copy_gemini_model_metadata(record, &mut model);
+
+    Some(Value::Object(model))
+}
+
+fn gemini_display_name(record: &Value, model_id: &str) -> String {
+    record
+        .get("displayName")
+        .and_then(Value::as_str)
+        .or_else(|| record.get("display_name").and_then(Value::as_str))
+        .or_else(|| {
+            record
+                .get("owned_by")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| model_id.to_owned())
+}
+
+fn model_version_from_created(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(number) => Some(number.to_string()),
+        Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn copy_gemini_model_metadata(record: &Value, out: &mut Map<String, Value>) {
+    let metadata = model_metadata_object(record);
+    for (openai_key, gemini_key) in [
+        ("base_model_id", "baseModelId"),
+        ("baseModelId", "baseModelId"),
+        ("description", "description"),
+        ("input_token_limit", "inputTokenLimit"),
+        ("inputTokenLimit", "inputTokenLimit"),
+        ("output_token_limit", "outputTokenLimit"),
+        ("outputTokenLimit", "outputTokenLimit"),
+    ] {
+        if let Some(value) = record.get(openai_key).or_else(|| metadata.and_then(|meta| meta.get(openai_key))) {
+            out.entry(gemini_key.to_owned()).or_insert_with(|| value.clone());
+        }
+    }
+}
+
 pub fn rewrite_gemini_request(root: Value, stream: bool, backend_model: &str) -> Value {
     let model = if backend_model.is_empty() {
         "local-model"
@@ -3256,6 +3386,100 @@ mod tests {
     }
 
     #[test]
+    fn sanitizes_backend_incompatible_request_fields_idempotently() {
+        let input = json!({
+            "model":"local",
+            "reasoning_effort":"high",
+            "thinking":{"type":"enabled"},
+            "max_completion_tokens":128,
+            "messages":[
+                {"role":"assistant","content":"hi","reasoning_content":"hidden","reasoning":{"text":"hidden"}},
+                "not an object"
+            ]
+        });
+
+        let once = sanitize_backend_request(input);
+        let twice = sanitize_backend_request(once.clone());
+
+        assert_eq!(once, twice);
+        assert!(once.get("reasoning_effort").is_none());
+        assert!(once.get("thinking").is_none());
+        assert!(once.get("max_completion_tokens").is_none());
+        assert_eq!(once["max_tokens"], 128);
+        assert!(once["messages"][0].get("reasoning_content").is_none());
+        assert!(once["messages"][0].get("reasoning").is_none());
+        assert_eq!(once["messages"][1], "not an object");
+    }
+
+    #[test]
+    fn sanitizer_drops_max_completion_tokens_when_max_tokens_exists() {
+        let out = sanitize_backend_request(json!({
+            "max_tokens":64,
+            "max_completion_tokens":128,
+            "messages":null
+        }));
+
+        assert_eq!(out["max_tokens"], 64);
+        assert!(out.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn sanitizer_leaves_non_object_inputs_unchanged() {
+        assert_eq!(sanitize_backend_request(json!(["reasoning_effort"])), json!(["reasoning_effort"]));
+        assert_eq!(sanitize_backend_request(Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn translates_openai_models_to_gemini_model_list() {
+        let input = json!({
+            "object":"list",
+            "next_page_token":"next-1",
+            "data":[
+                {
+                    "id":"llama-3.1-8b-instruct",
+                    "object":"model",
+                    "display_name":"Llama 3.1 8B Instruct",
+                    "created":1710000000,
+                    "meta":{
+                        "description":"local llama model",
+                        "input_token_limit":8192,
+                        "output_token_limit":2048
+                    }
+                },
+                {"id":"models/qwen3-32b"},
+                {"id":"registry.local/team/qwen3:8b"},
+                {"id":"models/org/nested/model-name"},
+                {"id":""},
+                {"id":"models/"},
+                {"object":"model"}
+            ]
+        });
+
+        let out = openai_models_to_gemini(input);
+        let models = out["models"].as_array().unwrap();
+        assert_eq!(models.len(), 4);
+        assert_eq!(models[0]["name"], "models/llama-3.1-8b-instruct");
+        assert_eq!(models[0]["displayName"], "Llama 3.1 8B Instruct");
+        assert_eq!(models[0]["supportedGenerationMethods"], json!(["generateContent", "streamGenerateContent"]));
+        assert_eq!(models[0]["description"], "local llama model");
+        assert_eq!(models[0]["inputTokenLimit"], 8192);
+        assert_eq!(models[0]["outputTokenLimit"], 2048);
+        assert_eq!(models[1]["name"], "models/qwen3-32b");
+        assert_eq!(models[1]["displayName"], "qwen3-32b");
+        assert_eq!(models[2]["name"], "models/registry.local/team/qwen3:8b");
+        assert_eq!(models[2]["displayName"], "registry.local/team/qwen3:8b");
+        assert_eq!(models[3]["name"], "models/org/nested/model-name");
+        assert_eq!(models[3]["displayName"], "org/nested/model-name");
+        assert_eq!(out["nextPageToken"], "next-1");
+    }
+
+    #[test]
+    fn gemini_model_list_handles_malformed_openai_models_response() {
+        assert_eq!(openai_models_to_gemini(json!({"data":"not an array"})), json!({"models":[]}));
+        assert_eq!(openai_models_to_gemini(Value::Null), json!({"models":[]}));
+    }
+
+    #[test]
     fn gemini_candidate_count_is_not_forwarded_without_multi_candidate_support() {
         let input = json!({
             "contents":[{"role":"user","parts":[{"text":"hello"}]}],
@@ -3443,6 +3667,9 @@ mod tests {
             protocol_for_path("/v1beta/models/gemini-2.5-flash:generateContent"),
             Protocol::Gemini
         );
+        assert_eq!(protocol_for_path("/v1beta/models"), Protocol::Gemini);
+        assert!(is_gemini_model_list_path("/v1beta/models"));
+        assert!(is_gemini_model_list_path("/gemini/v1beta/models"));
     }
 
     #[test]

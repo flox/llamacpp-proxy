@@ -4,7 +4,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "llamacpp-proxy";
-  version = "0.4.2";
+  version = "0.4.3";
   src = root;
   cargoLock.lockFile = "${root}/Cargo.lock";
   meta = {
