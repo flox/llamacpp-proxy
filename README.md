@@ -12,7 +12,7 @@ This crate is designed as a rigorous starting implementation with unit-tested pr
 - Anthropic Messages JSON Schema normalization for Claude Code tool schemas, with a conservative parser-compatible default and an opt-in semantic mode for verified backends.
 - Gemini `generateContent` and `streamGenerateContent` translation to OpenAI Chat Completions, including strict-safe tool-call ID mapping for multi-turn function responses, synthetic call IDs for orphan tool results, part-order-preserving mixed content translation, content-based Gemini request detection, backend-model forwarding that ignores Gemini path model names, single-candidate request semantics, and HTTP-status-preserving Gemini error conversion.
 - Ollama native API translation for `/api/chat`, `/api/generate`, `/api/tags`, and `/api/show`, plus synthetic model-lifecycle responses for `/api/pull` and `/api/delete`. `/api/show` queries backend `/v1/models` and reshapes the selected backend model record into Ollama show-detail JSON. Ollama chat and generate requests preserve Ollama's default streaming behavior by requesting OpenAI Chat Completions streaming unless the client sends `stream: false`, converting backend SSE frames to Ollama NDJSON, parsing SSE frame boundaries over bytes so split UTF-8 survives intact, and converting backend JSON error bodies into Ollama-shaped NDJSON errors when a stream fails before SSE begins.
-- Health check with backend reachability.
+- Health check with backend reachability and Ollama fallback probing.
 - Concurrent async request handling through Tokio + Hyper.
 - Streaming pass-through for ordinary paths, SSE translation for Gemini text/tool-call chunks, OpenAI Responses SSE metadata-preserving data rewrites, and Anthropic SSE response defaulting for Claude Code compatibility.
 - Conservative request/response header forwarding that drops hop-by-hop headers and replaces inbound `Accept-Encoding` with `identity` for backend requests whose bodies may be translated.
@@ -161,6 +161,7 @@ For non-streaming Anthropic message-shaped responses and Anthropic SSE message/c
 
 The proxy maps:
 
+- `GET /v1beta/models` (and `/gemini/v1beta/models`) to `GET /v1/models`, translating the OpenAI model list into Gemini's model discovery format with `name`, `displayName`, `supportedGenerationMethods`, and available metadata. This enables gemini-cli's interactive model picker to show locally available models.
 - `POST /v1beta/models/{model}:generateContent` to `POST /v1/chat/completions`.
 - `POST /v1beta/models/{model}:streamGenerateContent` to streamed Chat Completions.
 - Nonstandard paths carrying Gemini-shaped JSON bodies to `POST /v1/chat/completions` as well.
@@ -207,10 +208,21 @@ The proxy distinguishes hard proxy failures from translation failures:
 
 - Hard proxy failures, such as a body exceeding `--max-body-bytes`, backend connection failure, and backend timeout, receive protocol-shaped JSON errors. Gemini error bodies use the same HTTP status code in `error.code` and map it to the closest Gemini canonical status string, such as `INVALID_ARGUMENT`, `UNAUTHENTICATED`, `NOT_FOUND`, `RESOURCE_EXHAUSTED`, or `DEADLINE_EXCEEDED`.
 - Malformed JSON on recognized translation endpoints returns a protocol-shaped `400` without contacting the backend. This applies to `/v1/responses`, `/v1/messages`, Ollama JSON endpoints, and Gemini generation paths such as `/v1beta/models/{model}:generateContent` and `/v1beta/models/{model}:streamGenerateContent`.
-- Well-formed request translation failures, such as unexpected request shapes that cannot be normalized safely, are logged to stderr with method, path, protocol, byte length, and the raw request body, then forwarded unchanged to `llama-server` at the original path.
+- Well-formed request translation failures, such as unexpected request shapes that cannot be normalized safely, are logged to stderr with method, path, protocol, byte length, and the raw request body, then forwarded to `llama-server` at the original path after backend-incompatible field sanitization (see below).
 - Responses from that fallback request are returned without response translation so `llama-server` errors or pass-through behavior propagate unchanged.
 
 This matches the brief's split between malformed request bodies and translation failures: syntactically invalid JSON gets a protocol-shaped `400`, while surprising but well-formed client requests fall back to best-effort pass-through.
+
+## Backend request sanitization
+
+All requests forwarded to the backend are sanitized to remove fields that local inference servers do not support:
+
+- `reasoning_effort` is removed from the top-level request body.
+- `thinking` is removed from the top-level request body.
+- `max_completion_tokens` is renamed to `max_tokens` when `max_tokens` is absent; if both are present, `max_completion_tokens` is dropped.
+- `reasoning_content` and `reasoning` are removed from any message object in the `messages` array.
+
+This sanitization applies to all protocols, including translation failure fallback and pass-through paths. Non-JSON request bodies pass through unchanged.
 
 ## Health check
 
@@ -221,10 +233,16 @@ curl -s http://127.0.0.1:8081/health | jq
 A healthy response looks like:
 
 ```json
-{"status":"ok","backend_ok":true,"backend":"http://127.0.0.1:8080"}
+{"status":"ok","backend_ok":true,"backend":"http://127.0.0.1:8080","backend_probe_method":"GET","backend_probe_path":"/health"}
 ```
 
-If the backend does not respond successfully, the proxy returns `503` or `504` with `backend_ok: false`.
+If the backend returns 404 on `/health`, the proxy falls back to `GET /` and treats a 200 response containing `"Ollama is running"` as healthy. The response includes `backend_probe_path` and `primary_backend_status` so operators can see which probe succeeded:
+
+```json
+{"status":"ok","backend_ok":true,"backend":"http://127.0.0.1:8080","backend_probe_method":"GET","backend_probe_path":"/","primary_backend_status":404}
+```
+
+If neither probe succeeds, the proxy returns `503` or `504` with `backend_ok: false`.
 
 ## Design notes
 
