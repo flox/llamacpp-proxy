@@ -1,8 +1,8 @@
 # llamacpp-proxy
 
-`llamacpp-proxy` is a small Rust HTTP proxy that makes `llama-server` easier to use with coding-agent harnesses that speak OpenAI Responses, Anthropic Messages, Gemini native APIs, and Ollama native APIs.
+`llamacpp-proxy` is a small Rust HTTP proxy that lets coding-agent harnesses talk to any OpenAI Chat Completions-compatible backend — llama-server, Ollama, vLLM, or anything else that speaks `/v1/chat/completions`. It translates OpenAI Responses, Anthropic Messages, Gemini native APIs, and Ollama native APIs on the fly.
 
-It listens locally, translates only the protocol pieces that `llama-server` cannot currently parse, forwards to a single `llama-server` backend, and rewrites responses when the client expects a different wire format.
+It listens locally, translates only the protocol pieces that the backend cannot parse natively, forwards to a single backend, and rewrites responses when the client expects a different wire format.
 
 ## Status
 
@@ -81,7 +81,7 @@ Usage:
 
 Options:
   --listen <ADDR:PORT>                 Proxy listen address [default: 127.0.0.1:8081]
-  --backend <ADDR:PORT|URL>            llama-server backend [default: 127.0.0.1:8080]
+  --backend <ADDR:PORT|URL>            Backend server (llama-server, Ollama, vLLM, etc.) [default: 127.0.0.1:8080]
   --backend-api-key <KEY>              Backend API key [default: llamacpp-local]
   --backend-model <MODEL>              Backend model used for Gemini rewrites and synthetic protocol metadata [default: local-model]
   --gemini-listen <ADDR:PORT>          Optional second listener for GOOGLE_GEMINI_BASE_URL
@@ -99,7 +99,7 @@ Options:
 
 ### `/v1/responses`
 
-The proxy rewrites every tool to a `type: "function"` tool before forwarding to `llama-server`.
+The proxy rewrites every tool to a `type: "function"` tool before forwarding to the backend.
 
 Namespace tools become flat function tools with a namespace prefix:
 
@@ -142,7 +142,7 @@ Do not promote `experimental-wrapped` to the default unless a captured Codex Res
 
 ### `/v1/messages`
 
-The proxy normalizes Anthropic `input_schema` definitions before forwarding. The default `--anthropic-schema-mode compat` is intentionally conservative because the exact `llama-server` Anthropic schema parser allowlist is empirical:
+The proxy normalizes Anthropic `input_schema` definitions before forwarding. The default `--anthropic-schema-mode compat` is intentionally conservative because backend Anthropic schema parser support varies:
 
 - Adds missing `type` fields instead of dropping untyped properties.
 - Lowercases known JSON Schema type names.
@@ -151,9 +151,9 @@ The proxy normalizes Anthropic `input_schema` definitions before forwarding. The
 - Inlines nullable single-branch `anyOf`, `oneOf`, and `allOf` forms while adding a description note that null is accepted.
 - Merges same-type multi-branch object/array schemas when possible.
 - Converts unsupported multi-branch or parser-unfriendly schema details into compact `description` notes rather than silently discarding them.
-- Still strips extension-style fields that are known to make `llama-server` reject schemas.
+- Still strips extension-style fields that are known to make backends reject schemas.
 
-Use `--anthropic-schema-mode semantic` only after testing the target `llama-server` build with representative Claude Code schemas. Semantic mode preserves the larger set of standard JSON Schema constraints from earlier bundles.
+Use `--anthropic-schema-mode semantic` only after testing the target backend with representative Claude Code schemas. Semantic mode preserves the larger set of standard JSON Schema constraints from earlier bundles.
 
 For non-streaming Anthropic message-shaped responses and Anthropic SSE message/content-block events, the proxy adds safe Claude Code compatibility defaults if the backend omits them: top-level message `type`, `role`, `stop_reason`, `stop_sequence`, zero-valued `usage`, and per-content-block `cache_control: {"type":"ephemeral"}`. Existing fields are never overwritten. Anthropic error-shaped JSON bodies, including roots with `type: "error"` or an `error` object, pass through unchanged so backend and proxy errors keep their protocol shape.
 
@@ -166,7 +166,7 @@ The proxy maps:
 - `POST /v1beta/models/{model}:streamGenerateContent` to streamed Chat Completions.
 - Nonstandard paths carrying Gemini-shaped JSON bodies to `POST /v1/chat/completions` as well.
 
-The `{model}` segment in Gemini URLs is treated as informational only. Translated Chat Completions requests always use `--backend-model` for the outgoing `model` field, so a client path such as `/v1beta/models/gemini-2.5-flash:generateContent` does not leak `gemini-2.5-flash` to `llama-server`. This matches a single-backend design where the backend server already owns model selection.
+The `{model}` segment in Gemini URLs is treated as informational only. Translated Chat Completions requests always use `--backend-model` for the outgoing `model` field, so a client path such as `/v1beta/models/gemini-2.5-flash:generateContent` does not leak `gemini-2.5-flash` to the backend. This matches a single-backend design where the backend server already owns model selection.
 
 Content-based Gemini detection is intentionally narrow: the proxy requires a Gemini `contents[].parts[]` shape with Gemini indicators such as `systemInstruction.parts`, `tools[].functionDeclarations[]`, `generationConfig`, or a contents-only request. OpenAI-style bodies with `messages` or `input` remain pass-through.
 
@@ -208,8 +208,8 @@ The proxy distinguishes hard proxy failures from translation failures:
 
 - Hard proxy failures, such as a body exceeding `--max-body-bytes`, backend connection failure, and backend timeout, receive protocol-shaped JSON errors. Gemini error bodies use the same HTTP status code in `error.code` and map it to the closest Gemini canonical status string, such as `INVALID_ARGUMENT`, `UNAUTHENTICATED`, `NOT_FOUND`, `RESOURCE_EXHAUSTED`, or `DEADLINE_EXCEEDED`.
 - Malformed JSON on recognized translation endpoints returns a protocol-shaped `400` without contacting the backend. This applies to `/v1/responses`, `/v1/messages`, Ollama JSON endpoints, and Gemini generation paths such as `/v1beta/models/{model}:generateContent` and `/v1beta/models/{model}:streamGenerateContent`.
-- Well-formed request translation failures, such as unexpected request shapes that cannot be normalized safely, are logged to stderr with method, path, protocol, byte length, and the raw request body, then forwarded to `llama-server` at the original path after backend-incompatible field sanitization (see below).
-- Responses from that fallback request are returned without response translation so `llama-server` errors or pass-through behavior propagate unchanged.
+- Well-formed request translation failures, such as unexpected request shapes that cannot be normalized safely, are logged to stderr with method, path, protocol, byte length, and the raw request body, then forwarded to the backend at the original path after backend-incompatible field sanitization (see below).
+- Responses from that fallback request are returned without response translation so backend errors or pass-through behavior propagate unchanged.
 
 This matches the brief's split between malformed request bodies and translation failures: syntactically invalid JSON gets a protocol-shaped `400`, while surprising but well-formed client requests fall back to best-effort pass-through.
 
@@ -255,6 +255,6 @@ If neither probe succeeds, the proxy returns `503` or `504` with `backend_ok: fa
 
 ## Codex namespace response handling
 
-Codex namespace tool calls use a conservative, evidence-gated response policy. Incoming namespace tools are flattened for `llama-server` with collision-resistant `namespace__tool` names. Responses are translated back to ordinary `function_call` objects by stripping the synthetic prefix, including in streaming SSE output-item payloads. Responses SSE frame metadata is preserved exactly at the field level; only the JSON `data:` payload is replaced when translation is needed.
+Codex namespace tool calls use a conservative, evidence-gated response policy. Incoming namespace tools are flattened for the backend with collision-resistant `namespace__tool` names. Responses are translated back to ordinary `function_call` objects by stripping the synthetic prefix, including in streaming SSE output-item payloads. Responses SSE frame metadata is preserved exactly at the field level; only the JSON `data:` payload is replaced when translation is needed.
 
 The previous wrapper shape (`type: "namespace_call"`, `namespace`, `name`, nested `call`) remains available only via `--codex-namespace-response-mode experimental-wrapped`; it is intentionally documented as unproven because the bundle does not include captured Codex traffic that establishes this exact schema. Add real fixtures under `fixtures/codex/observed/` before treating a wrapper mode as rigorous.
